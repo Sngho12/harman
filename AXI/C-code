@@ -1,0 +1,275 @@
+
+#include <stdio.h>
+#include <stdint.h> // uint32_t를 사용하기 위함.
+#include "platform.h"
+#include "xil_printf.h"
+#include "xparameters.h" // (ctrl + space bar 하면 자동완성 기능) -> baase addr 확인가능
+#include "sleep.h" // delay 가능
+
+typedef struct {
+	volatile uint32_t tx_data; // 8bit tx data
+	volatile uint32_t rx_data; // 8bit rx data
+	volatile uint32_t mode; // 00: send data, 01:send start, 10: send stop, 11: read data
+	volatile uint32_t enable; // 1bit enable
+	volatile uint32_t done; // 1bit done
+	volatile uint32_t ready; // 1bit ready
+} I2C_TypeDef;
+
+typedef struct {
+	volatile uint32_t CR;
+	volatile uint32_t SOD;
+	volatile uint32_t SID;
+	volatile uint32_t SR;
+} SPI_TypeDef;
+
+typedef struct {
+	volatile uint32_t DR;
+	volatile uint32_t CR; // 0:output, 1:input
+} GPIO_TypeDef;
+
+#define I2C_BASEADDR 0x44A00000
+#define I2C ((I2C_TypeDef*)(I2C_BASEADDR))
+#define SPI_BASEADDR 0x44A10000
+#define SPI ((SPI_TypeDef*)(SPI_BASEADDR))
+#define GPIO_BASEADDR 0x40000000
+#define GPIOA ((GPIO_TypeDef *)(GPIO_BASEADDR)) // 전체괄호 쳐야함
+#define gpio_addr  112
+#define ultra_addr  96
+// I2C
+void send_start(I2C_TypeDef* I2Cx);
+void send_data(I2C_TypeDef* I2Cx, uint32_t data);
+uint32_t read_data(I2C_TypeDef* I2Cx);
+void send_stop(I2C_TypeDef* I2Cx);
+// SPI
+void set_low_data(SPI_TypeDef* SPIx, uint32_t data);
+void set_high_data(SPI_TypeDef* SPIx, uint32_t data);
+// BTN
+#define BUTTON_U    0
+#define BUTTON_L    1
+#define BUTTON_R    2
+#define BUTTON_D    3
+
+void button_init(GPIO_TypeDef *GPIOx);
+uint32_t button_read(GPIO_TypeDef *GPIOx);
+uint32_t btn_state_check(GPIO_TypeDef *GPIOx, uint32_t btn_position, uint32_t* btn_state);
+enum {NN,NP,PP,PN}; // not pushed-not pushed / not pushed-pushed / pushed-pushed / pushed-not pushed
+
+// I2C-Ultra
+void I2C_Ultra_Start(I2C_TypeDef* I2Cx);
+uint32_t I2C_Ultra_GetData(I2C_TypeDef* I2Cx);
+
+// I2C-GPIO
+void I2C_GPIO_Init(I2C_TypeDef* I2Cx, uint32_t mode);
+uint32_t I2C_GPIO_GetData(I2C_TypeDef* I2Cx);
+void I2C_GPIO_SendData(I2C_TypeDef* I2Cx, uint32_t data);
+
+int main(){
+	button_init(GPIOA);
+	uint32_t btn_state[] = {NN,NN,NN,NN};
+	uint32_t dot = 1;
+	uint32_t rdata;
+	uint32_t rdata_low;
+	uint32_t rdata_high;
+
+	I2C_Ultra_Start(I2C);
+	I2C_GPIO_Init(I2C,0xf);
+	while(1){
+		if( btn_state_check(GPIOA, BUTTON_U, btn_state) == PN ){
+			dot = (dot <<1) | (dot>>3);
+			I2C_GPIO_SendData(I2C,dot);
+		} else if(btn_state_check(GPIOA, BUTTON_D, btn_state) == PN ){
+			dot = (dot >>1) | (dot<<3);
+			I2C_GPIO_SendData(I2C,dot);
+		}
+		else if(btn_state_check(GPIOA, BUTTON_L, btn_state) == PN ){
+			rdata = I2C_Ultra_GetData(I2C);
+
+			rdata_high = rdata>>8;
+			rdata_low = rdata - rdata_high;
+
+			set_low_data(SPI, rdata_low);
+			set_high_data(SPI, rdata_high);
+			xil_printf("rdata : %d\n", rdata);
+		}else if(btn_state_check(GPIOA, BUTTON_R, btn_state) == PN ){
+		}
+		usleep(3000);
+	}
+	return 0;
+}
+
+void send_start(I2C_TypeDef* I2Cx)
+{
+	if(I2Cx->ready == 1){
+		I2Cx->mode = 1;
+		I2Cx->enable = 1;
+		I2Cx->enable = 0;
+	}
+	while(I2Cx->ready != 1){}
+	return;
+}
+void send_data(I2C_TypeDef* I2Cx, uint32_t data)
+{
+	if(I2Cx->ready == 1){
+		I2Cx->tx_data = data;
+		I2Cx->mode = 0;
+		I2Cx->enable = 1;
+		I2Cx->enable = 0;
+	}
+	while(I2Cx->ready != 1){}
+	return;
+}
+uint32_t read_data(I2C_TypeDef* I2Cx){
+	if(I2Cx->ready == 1){
+		I2Cx->mode = 3;
+		I2Cx->enable = 1;
+		I2Cx->enable = 0;
+	}
+	while(I2Cx->ready != 1){}
+	return I2Cx->rx_data;
+}
+void send_stop(I2C_TypeDef* I2Cx)
+{
+	if(I2Cx->ready == 1){
+		I2Cx->mode = 2;
+		I2Cx->enable = 1;
+		I2Cx->enable = 0;
+	}
+	while(I2Cx->ready != 1){}
+	return;
+}
+void button_init(GPIO_TypeDef *GPIOx)
+{
+	GPIOx->CR = 0xf; // GPIO 4개 입력모드
+}
+uint32_t button_read(GPIO_TypeDef *GPIOx)
+{
+	return GPIOx->DR;
+}
+
+uint32_t btn_state_check(GPIO_TypeDef *GPIOx, uint32_t btn_position, uint32_t* btn_state)
+{
+	uint32_t btn_read_result = button_read(GPIOx) & 1<<btn_position;
+	switch(btn_state[btn_position]){
+	case NN: if(btn_read_result){
+		btn_state[btn_position] = NP;
+		return NP;
+	} else {
+		btn_state[btn_position] = NN;
+		return NN;
+	}
+	break;
+	case NP: if(btn_read_result){
+		btn_state[btn_position] = PP;
+		return PP;
+	} else {
+		btn_state[btn_position] = PN;
+		return PN;
+	}
+	break;
+	case PP: if(btn_read_result){
+		btn_state[btn_position] = PP;
+		return PP;
+	} else {
+		btn_state[btn_position] = PN;
+		return PN;
+	}
+	break;
+	case PN: if(btn_read_result){
+		btn_state[btn_position] = NP;
+		return NP;
+	} else {
+		btn_state[btn_position] = NN;
+		return NN;
+	}
+	break;
+	}
+	return -1;
+}
+
+void I2C_Ultra_Start(I2C_TypeDef* I2Cx)
+{
+	send_start(I2C);
+	send_data(I2C,ultra_addr<<1);
+	send_data(I2C,0);
+	send_data(I2C,1);
+	send_stop(I2C);
+	return;
+}
+
+uint32_t I2C_Ultra_GetData(I2C_TypeDef* I2Cx)
+{
+	uint32_t data1;
+	uint32_t data2;
+
+	send_start(I2C);
+	send_data(I2C,(ultra_addr<<1)+1);
+	send_data(I2C,1);
+	data1 = read_data(I2C);
+	send_stop(I2C);
+
+	send_start(I2C);
+	send_data(I2C,(ultra_addr<<1)+1);
+	send_data(I2C,2);
+	data2 = read_data(I2C);
+	send_stop(I2C);
+
+	return ((data2<<7) + data1) ;
+}
+
+void I2C_GPIO_Init(I2C_TypeDef* I2Cx, uint32_t mode)
+{
+	send_start(I2C);
+	send_data(I2C,gpio_addr<<1);
+	send_data(I2C,0);
+	send_data(I2C,mode);
+	send_stop(I2C);
+	return;
+}
+
+uint32_t I2C_GPIO_GetData(I2C_TypeDef* I2Cx)
+{
+	uint32_t data;
+	send_start(I2C);
+	send_data(I2C,(gpio_addr<<1)+1);
+	send_data(I2C,1); //reg num 1: idr
+	data = read_data(I2C);
+	send_stop(I2C);
+	return data;
+}
+
+void I2C_GPIO_SendData(I2C_TypeDef* I2Cx, uint32_t data)
+{
+	send_start(I2C);
+	send_data(I2C,gpio_addr<<1);
+	send_data(I2C,2); // reg num 2: odr
+	send_data(I2C,data);
+	send_stop(I2C);
+	return ;
+}
+
+void set_low_data(SPI_TypeDef* SPIx, uint32_t data)
+{
+	SPIx -> SOD = 0x80; // 값 주기
+	SPIx -> CR = 1;      // 시작
+	SPIx -> CR = 0;      // start reg off
+	while ( ((SPIx-> SR) != 1) ){}
+
+	SPIx -> SOD = data; // 값 주기
+	SPIx -> CR = 1;      // 시작
+	SPIx -> CR = 0;      // start reg off
+	while ( ((SPIx-> SR) != 1) ){}
+	return;
+}
+void set_high_data(SPI_TypeDef* SPIx, uint32_t data)
+{
+	SPIx -> SOD = 0x81; // 값 주기
+	SPIx -> CR = 1;      // 시작
+	SPIx -> CR = 0;      // start reg off
+	while ( ((SPIx-> SR) != 1) ){}
+
+	SPIx -> SOD = data; // 값 주기
+	SPIx -> CR = 1;      // 시작
+	SPIx -> CR = 0;      // start reg off
+	while ( ((SPIx-> SR) != 1) ){}
+	return;
+}
